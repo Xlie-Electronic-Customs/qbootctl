@@ -48,6 +48,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -57,7 +58,7 @@
 #include <unistd.h>
 
 #include "gpt-utils.h"
-#include "ufs-bsg.h"
+#include "crc32.h"
 #include "utils.h"
 
 #include "bootctrl.h"
@@ -66,29 +67,164 @@
 #define BOOT_IMG_PTN_NAME "boot_"
 #define LUN_NAME_END_LOC  14
 #define BOOT_SLOT_PROP	  "slot_suffix"
+#define MISC_DEVICE	  "/dev/disk/by-partlabel/misc"
 
 #define MAX_CMDLINE_SIZE  4096
-
-#define SLOT_ACTIVE	  1
-#define SLOT_INACTIVE	  2
-#define UPDATE_SLOT(pentry, guid, slot_state)                                                      \
-	({                                                                                         \
-		memcpy(pentry, guid, TYPE_GUID_SIZE);                                              \
-		if (slot_state == SLOT_ACTIVE)                                                     \
-			*(pentry + AB_FLAG_OFFSET) = AB_SLOT_ACTIVE_VAL;                           \
-		else if (slot_state == SLOT_INACTIVE)                                              \
-			*(pentry + AB_FLAG_OFFSET) =                                               \
-				(*(pentry + AB_FLAG_OFFSET) & ~AB_PARTITION_ATTR_SLOT_ACTIVE);     \
-	})
+#define BOOTLOADER_CONTROL_OFFSET 2048
+#define BOOT_CTRL_MAGIC   0x42414342
+#define BOOT_CTRL_VERSION 1
+#define DEFAULT_BOOT_ATTEMPTS 7
+#define ACTIVE_BOOT_PRIORITY 15
+#define ACTIVE_BOOT_TRIES 6
 
 const char *slot_suffix_arr[] = { AB_SLOT_A_SUFFIX, AB_SLOT_B_SUFFIX, NULL };
 
-enum part_attr_type {
-	ATTR_SLOT_ACTIVE = 0,
-	ATTR_BOOT_SUCCESSFUL,
-	ATTR_UNBOOTABLE,
-	ATTR_BOOTABLE,
-};
+unsigned get_number_slots();
+static int get_current_or_active_slot();
+void get_kernel_cmdline_arg(const char *arg, char *buf, const char *def);
+
+struct slot_metadata {
+	uint8_t priority : 4;
+	uint8_t tries_remaining : 3;
+	uint8_t successful_boot : 1;
+	uint8_t verity_corrupted : 1;
+	uint8_t reserved : 7;
+} __attribute__((packed));
+
+struct bootloader_control {
+	char slot_suffix[4];
+	uint32_t magic;
+	uint8_t version;
+	uint8_t nb_slot : 3;
+	uint8_t recovery_tries_remaining : 3;
+	uint8_t merge_status : 3;
+	uint8_t reserved0[1];
+	struct slot_metadata slot_info[4];
+	uint8_t reserved1[8];
+	uint32_t crc32_le;
+} __attribute__((packed));
+
+static uint32_t bootloader_control_crc(const struct bootloader_control *ctrl)
+{
+	return efi_crc32(ctrl, offsetof(struct bootloader_control, crc32_le));
+}
+
+static bool misc_ctrl_valid(const struct bootloader_control *ctrl)
+{
+	return ctrl->magic == BOOT_CTRL_MAGIC &&
+	       ctrl->version == BOOT_CTRL_VERSION &&
+	       ctrl->nb_slot > 0 &&
+	       ctrl->nb_slot <= 4 &&
+	       ctrl->crc32_le == bootloader_control_crc(ctrl);
+}
+
+static int read_misc_bootloader_control(struct bootloader_control *ctrl)
+{
+	int fd;
+	ssize_t rc;
+
+	fd = open(MISC_DEVICE, O_RDONLY);
+	if (fd < 0) {
+		fprintf(stderr, "Failed to open %s: %s\n", MISC_DEVICE, strerror(errno));
+		return -1;
+	}
+
+	if (lseek(fd, BOOTLOADER_CONTROL_OFFSET, SEEK_SET) != BOOTLOADER_CONTROL_OFFSET) {
+		fprintf(stderr, "Failed to seek %s: %s\n", MISC_DEVICE, strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	rc = read(fd, ctrl, sizeof(*ctrl));
+	close(fd);
+	if (rc != sizeof(*ctrl)) {
+		fprintf(stderr, "Failed to read bootloader control from %s\n", MISC_DEVICE);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int write_misc_bootloader_control(struct bootloader_control *ctrl)
+{
+	int fd;
+	ssize_t rc;
+
+	ctrl->crc32_le = bootloader_control_crc(ctrl);
+
+	fd = open(MISC_DEVICE, O_WRONLY | O_SYNC);
+	if (fd < 0) {
+		fprintf(stderr, "Failed to open %s: %s\n", MISC_DEVICE, strerror(errno));
+		return -1;
+	}
+
+	if (lseek(fd, BOOTLOADER_CONTROL_OFFSET, SEEK_SET) != BOOTLOADER_CONTROL_OFFSET) {
+		fprintf(stderr, "Failed to seek %s: %s\n", MISC_DEVICE, strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	rc = write(fd, ctrl, sizeof(*ctrl));
+	if (rc != sizeof(*ctrl)) {
+		fprintf(stderr, "Failed to write bootloader control to %s\n", MISC_DEVICE);
+		close(fd);
+		return -1;
+	}
+
+	fsync(fd);
+	close(fd);
+	return 0;
+}
+
+static void init_default_misc_bootloader_control(struct bootloader_control *ctrl)
+{
+	unsigned int num_slots = get_number_slots();
+	char bootSlotProp[MAX_CMDLINE_SIZE] = { '\0' };
+	int current_slot = 0;
+
+	memset(ctrl, 0, sizeof(*ctrl));
+	if (num_slots == 0 || num_slots > 4)
+		num_slots = 2;
+
+	get_kernel_cmdline_arg(BOOT_SLOT_PROP, bootSlotProp, "N/A");
+	for (unsigned int i = 0; slot_suffix_arr[i] != NULL; i++) {
+		if (!strncmp(bootSlotProp, slot_suffix_arr[i], strlen(slot_suffix_arr[i]))) {
+			current_slot = i;
+			break;
+		}
+	}
+
+	if (current_slot < 0 || (unsigned)current_slot >= num_slots)
+		current_slot = 0;
+
+	strncpy(ctrl->slot_suffix, slot_suffix_arr[current_slot], sizeof(ctrl->slot_suffix) - 1);
+	ctrl->magic = BOOT_CTRL_MAGIC;
+	ctrl->version = BOOT_CTRL_VERSION;
+	ctrl->nb_slot = num_slots;
+
+	for (unsigned int i = 0; i < 4; i++) {
+		if (i < num_slots) {
+			ctrl->slot_info[i].priority = 7;
+			ctrl->slot_info[i].tries_remaining = DEFAULT_BOOT_ATTEMPTS;
+		}
+	}
+
+	ctrl->slot_info[current_slot].successful_boot = 1;
+	ctrl->crc32_le = bootloader_control_crc(ctrl);
+}
+
+static int load_misc_bootloader_control(struct bootloader_control *ctrl)
+{
+	if (read_misc_bootloader_control(ctrl))
+		return -1;
+
+	if (misc_ctrl_valid(ctrl))
+		return 0;
+
+	fprintf(stderr, "Invalid /misc bootloader_control metadata; reinitializing it\n");
+	init_default_misc_bootloader_control(ctrl);
+	return write_misc_bootloader_control(ctrl);
+}
 
 void get_kernel_cmdline_arg(const char *arg, char *buf, const char *def)
 {
@@ -118,148 +254,6 @@ void get_kernel_cmdline_arg(const char *arg, char *buf, const char *def)
 
 error:
 	strcpy(buf, def);
-}
-
-// Get the value of one of the attribute fields for a partition.
-static int get_partition_attribute(struct gpt_disk *disk, const char *partname,
-				   enum part_attr_type part_attr)
-{
-	uint8_t *pentry = NULL;
-	int retval = -1;
-	uint8_t *attr = NULL;
-	if (!partname)
-		return -1;
-
-	// Will initialise the disk if null, or reinitialise it if
-	// it's for a partition on a different disk
-	if (gpt_disk_get_disk_info(partname, disk) < 0) {
-		fprintf(stderr, "%s: gpt_disk_get_disk_info failed\n", __func__);
-		return -1;
-	}
-
-	pentry = gpt_disk_get_pentry(disk, partname, PRIMARY_GPT);
-
-	if (!pentry) {
-		fprintf(stderr, "%s: pentry does not exist in disk struct\n", __func__);
-		return -1;
-	}
-
-	attr = pentry + AB_FLAG_OFFSET;
-	LOGD("%s() partname = %s, attr = 0x%x\n", __func__, partname, *attr);
-	switch (part_attr) {
-	case ATTR_SLOT_ACTIVE:
-		retval = !!(*attr & AB_PARTITION_ATTR_SLOT_ACTIVE);
-		LOGD("ATTR_SLOT_ACTIVE, retval = %d\n", retval);
-		break;
-	case ATTR_BOOT_SUCCESSFUL:
-		retval = !!(*attr & AB_PARTITION_ATTR_BOOT_SUCCESSFUL);
-		LOGD("AB_PARTITION_ATTR_BOOT_SUCCESSFUL, retval = %d\n", retval);
-		break;
-	case ATTR_UNBOOTABLE:
-		retval = !!(*attr & AB_PARTITION_ATTR_UNBOOTABLE);
-		LOGD("AB_PARTITION_ATTR_UNBOOTABLE, retval = %d\n", retval);
-		break;
-	default:
-		retval = -1;
-	}
-
-	return retval;
-}
-
-// Set a particular attribute for all the partitions in a
-// slot
-static int update_slot_attribute(struct gpt_disk *disk, unsigned slot,
-				 enum part_attr_type ab_attr)
-{
-	unsigned int i = 0;
-	char buf[GPT_PTN_PATH_MAX];
-	struct stat st;
-	uint8_t *pentry = NULL;
-	uint8_t *pentry_bak = NULL;
-	int rc = -1;
-	uint8_t *attr = NULL;
-	uint8_t *attr_bak = NULL;
-	const char *partName;
-	char devpath[GPT_PTN_PATH_MAX] = { 0 };
-
-	for (i = 0; i < ARRAY_SIZE(g_all_ptns); i++) {
-		memset(buf, '\0', sizeof(buf));
-		// Check if A/B versions of this ptn exist
-		rc = snprintf(buf, sizeof(buf) - 1, "%s/%.72s", BOOT_DEV_DIR, g_all_ptns[i]);
-		if (stat(buf, &st) < 0) {
-			// partition does not have _a version
-			continue;
-		}
-
-		buf[strlen(buf) - 1] = 'b';
-		if (stat(buf, &st) < 0) {
-			// partition does not have _b version
-			continue;
-		}
-
-		if (slot == 0)
-			partName = g_all_ptns[i];
-		else
-			partName = buf + strlen(BOOT_DEV_DIR) + 1;
-
-		LOGD("%s: partName = '%s'\n", __func__, partName);
-
-		// If the current partition is for a different disk (e.g. /dev/sde when the current disk is /dev/sda)
-		// Then commit the current disk
-		if (!partition_is_for_disk(disk, partName, devpath, sizeof(devpath))) {
-			if (gpt_disk_commit(disk)) {
-				fprintf(stderr, "%s: Failed to commit disk\n", __func__);
-				return -1;
-			}
-		}
-
-		rc = gpt_disk_get_disk_info(partName, disk);
-		if (rc != 0) {
-			fprintf(stderr, "%s: Failed to get disk info for %s\n", __func__, partName);
-			return -1;
-		}
-
-		pentry = gpt_disk_get_pentry(disk, partName, PRIMARY_GPT);
-		pentry_bak = gpt_disk_get_pentry(disk, partName, SECONDARY_GPT);
-		if (!pentry || !pentry_bak) {
-			fprintf(stderr, "%s: Failed to get pentry/pentry_bak for %s\n", __func__,
-				partName);
-			return -1;
-		}
-
-		attr = pentry + AB_FLAG_OFFSET;
-		// LOGD("%s: got pentry for part '%s': 0x%lx (at flags: 0x%x)\n", __func__, partName,
-		//      *(uint64_t *)pentry, *attr);
-		attr_bak = pentry_bak + AB_FLAG_OFFSET;
-		switch (ab_attr) {
-		case ATTR_BOOT_SUCCESSFUL:
-			*attr = (*attr) | AB_PARTITION_ATTR_BOOT_SUCCESSFUL;
-			*attr_bak = (*attr_bak) | AB_PARTITION_ATTR_BOOT_SUCCESSFUL;
-			break;
-		case ATTR_UNBOOTABLE:
-			*attr = (*attr) | AB_PARTITION_ATTR_UNBOOTABLE;
-			*attr_bak = (*attr_bak) | AB_PARTITION_ATTR_UNBOOTABLE;
-			break;
-		case ATTR_BOOTABLE:
-			*attr = (*attr) ^ AB_PARTITION_ATTR_UNBOOTABLE;
-			*attr_bak = (*attr_bak) ^ AB_PARTITION_ATTR_UNBOOTABLE;
-			break;
-		case ATTR_SLOT_ACTIVE:
-			*attr = (*attr) | AB_PARTITION_ATTR_SLOT_ACTIVE;
-			*attr_bak = (*attr) | AB_PARTITION_ATTR_SLOT_ACTIVE;
-			break;
-		default:
-			fprintf(stderr, "%s: Unrecognized attr\n", __func__);
-			return -1;
-		}
-	}
-
-	if (gpt_disk_commit(disk)) {
-		fprintf(stderr, "%s: Failed to commit disk %s\n", __func__, disk->devpath);
-		return -1;
-	}
-
-	return 0;
 }
 
 /*
@@ -317,40 +311,24 @@ static int boot_control_check_slot_sanity(unsigned slot)
 	return 0;
 }
 
-int get_boot_attr(struct gpt_disk *disk, unsigned slot, enum part_attr_type attr)
-{
-	char bootPartition[MAX_GPT_NAME_SIZE + 1] = { 0 };
-
-	if (boot_control_check_slot_sanity(slot) != 0) {
-		fprintf(stderr, "%s: Argument check failed\n", __func__);
-		return -1;
-	}
-
-	snprintf(bootPartition, sizeof(bootPartition) - 1, "boot%s", slot_suffix_arr[slot]);
-
-	return get_partition_attribute(disk, bootPartition, attr);
-}
-
 unsigned get_active_boot_slot()
 {
-	struct gpt_disk disk = { 0 };
-	uint32_t num_slots = get_number_slots();
+	struct bootloader_control ctrl;
+	unsigned int active_slot = 0;
+	unsigned int max_priority;
 
-	if (num_slots <= 1) {
-		// Slot 0 is the only slot around.
+	if (load_misc_bootloader_control(&ctrl))
 		return 0;
-	}
 
-	for (uint32_t i = 0; i < num_slots; i++) {
-		if (get_boot_attr(&disk, i, ATTR_SLOT_ACTIVE)) {
-			gpt_disk_free(&disk);
-			return i;
+	max_priority = ctrl.slot_info[0].priority;
+	for (uint32_t i = 1; i < ctrl.nb_slot; i++) {
+		if (ctrl.slot_info[i].priority > max_priority) {
+			max_priority = ctrl.slot_info[i].priority;
+			active_slot = i;
 		}
 	}
 
-	fprintf(stderr, "%s: Failed to find the active boot slot\n", __func__);
-	gpt_disk_free(&disk);
-	return 0;
+	return active_slot;
 }
 
 /*
@@ -394,50 +372,36 @@ static int get_current_or_active_slot()
 
 int is_slot_bootable(unsigned slot)
 {
-	int attr = 0;
-	struct gpt_disk disk = { 0 };
+	struct bootloader_control ctrl;
 
-	attr = get_boot_attr(&disk, slot, ATTR_UNBOOTABLE);
-	if (attr >= 0)
-		return !attr;
+	if (boot_control_check_slot_sanity(slot) != 0)
+		return -1;
 
-	return -1;
+	if (load_misc_bootloader_control(&ctrl))
+		return -1;
+
+	if (slot >= ctrl.nb_slot)
+		return -1;
+
+	return ctrl.slot_info[slot].tries_remaining != 0;
 }
 
 int mark_boot_successful(unsigned slot)
 {
-	struct gpt_disk disk = { 0 };
-	int successful = get_boot_attr(&disk, slot, ATTR_BOOT_SUCCESSFUL);
-	int unbootable = get_boot_attr(&disk, slot, ATTR_UNBOOTABLE);
-	int ret = 0;
+	struct bootloader_control ctrl;
 
-	if (successful < 0 || unbootable < 0) {
-		fprintf(stderr, "SLOT %s: Failed to read attributes\n", slot_suffix_arr[slot]);
-		ret = -1;
-		goto out;
-	}
+	if (boot_control_check_slot_sanity(slot) != 0)
+		return -1;
 
-	if (unbootable) {
-		printf("SLOT %s: was marked unbootable, fixing this"
-		       " (I hope you know what you're doing...)\n",
-		       slot_suffix_arr[slot]);
-		update_slot_attribute(&disk, slot, ATTR_BOOTABLE);
-	}
+	if (load_misc_bootloader_control(&ctrl))
+		return -1;
 
-	if (successful) {
-		fprintf(stderr, "SLOT %s: already marked successful\n", slot_suffix_arr[slot]);
-		goto out;
-	}
+	if (slot >= ctrl.nb_slot)
+		return -1;
 
-	if (update_slot_attribute(&disk, slot, ATTR_BOOT_SUCCESSFUL)) {
-		fprintf(stderr, "SLOT %s: Failed to mark boot successful\n", slot_suffix_arr[slot]);
-		ret = -1;
-		goto out;
-	}
-
-out:
-	gpt_disk_free(&disk);
-	return ret;
+	ctrl.slot_info[slot].successful_boot = 1;
+	ctrl.slot_info[slot].tries_remaining = 1;
+	return write_misc_bootloader_control(&ctrl);
 }
 
 const char *get_suffix(unsigned slot)
@@ -449,199 +413,65 @@ const char *get_suffix(unsigned slot)
 }
 
 
-// The argument here is a vector of partition names(including the slot suffix)
-// that lie on a single disk
-static int boot_ctl_set_active_slot_for_partitions(struct gpt_disk *disk,
-						   unsigned slot)
-{
-	char buf[GPT_PTN_PATH_MAX] = { 0 };
-	const char *slotA;
-	char slotB[MAX_GPT_NAME_SIZE] = { 0 };
-	char active_guid[TYPE_GUID_SIZE + 1] = { 0 };
-	char inactive_guid[TYPE_GUID_SIZE + 1] = { 0 };
-	int rc, i;
-	// Pointer to the partition entry of current 'A' partition
-	uint8_t *pentryA = NULL;
-	uint8_t *pentryA_bak = NULL;
-	// Pointer to partition entry of current 'B' partition
-	uint8_t *pentryB = NULL;
-	uint8_t *pentryB_bak = NULL;
-	struct stat st;
-
-	LOGD("Marking slot %s as active:\n", slot_suffix_arr[slot]);
-
-	for (i = 0, slotA = g_all_ptns[0]; i < ARRAY_SIZE(g_all_ptns); slotA = g_all_ptns[++i]) {
-		// Chop off the slot suffix from the partition name to
-		// make the string easier to work with.
-		LOGD("Part: %s\n", slotA);
-		int n = strlen(slotA) - strlen(AB_SLOT_A_SUFFIX);
-		if (n + 1 < 3 || n + 1 > MAX_GPT_NAME_SIZE) {
-			fprintf(stderr, "Invalid partition name: %s\n", slotA);
-			return -1;
-		}
-
-		memset(slotB, 0, sizeof(slotB));
-		strncat(slotB, slotA, MAX_GPT_NAME_SIZE - 1);
-		slotB[strlen(slotB) - 1] = 'b';
-
-		rc = snprintf(buf, sizeof(buf) - 1, "%s", BOOT_DEV_DIR);
-		snprintf(buf + rc, GPT_PTN_PATH_MAX - rc, "/%s", slotA);
-		LOGD("Checking for partition %s\n", buf);
-		if (stat(buf, &st)) {
-			if (!strcmp(slotA, "boot_a") || !strcmp(slotA, "dtbo_a")) {
-				fprintf(stderr, "Couldn't find required partition %s\n", slotA);
-				return -1;
-			}
-			// Not every device has every partition
-			continue;
-		}
-
-		buf[strlen(buf) - 1] = 'b';
-		if (stat(buf, &st)) {
-			fprintf(stderr, "Partition %s does not exist\n", buf);
-			return -1;
-		}
-
-		// Get the disk containing this partition. This only
-		// actually re-initialises disk if this partition refers
-		// to a different block device than the last one.
-		if (gpt_disk_get_disk_info(slotA, disk) < 0)
-			return -1;
-
-		// Get partition entry for slot A & B from the primary
-		// and backup tables.
-		pentryA = gpt_disk_get_pentry(disk, slotA, PRIMARY_GPT);
-		pentryA_bak = gpt_disk_get_pentry(disk, slotA, SECONDARY_GPT);
-		pentryB = gpt_disk_get_pentry(disk, slotB, PRIMARY_GPT);
-		pentryB_bak = gpt_disk_get_pentry(disk, slotB, SECONDARY_GPT);
-		if (!pentryA || !pentryA_bak || !pentryB || !pentryB_bak) {
-			// None of these should be NULL since we have already
-			// checked for A & B versions earlier.
-			fprintf(stderr, "Slot pentries for %s not found.\n", slotA);
-			return -1;
-		}
-		LOGD("\tAB attr (A): 0x%x (backup: 0x%x)\n", *(uint16_t *)(pentryA + AB_FLAG_OFFSET),
-		     *(uint16_t *)(pentryA_bak + AB_FLAG_OFFSET));
-		LOGD("\tAB attr (B): 0x%x (backup: 0x%x)\n", *(uint16_t *)(pentryB + AB_FLAG_OFFSET),
-		     *(uint16_t *)(pentryB_bak + AB_FLAG_OFFSET));
-		memset(active_guid, '\0', sizeof(active_guid));
-		memset(inactive_guid, '\0', sizeof(inactive_guid));
-		if (get_partition_attribute(disk, slotA, ATTR_SLOT_ACTIVE) == 1) {
-			// A is the current active slot
-			memcpy((void *)active_guid, (const void *)pentryA, TYPE_GUID_SIZE);
-			memcpy((void *)inactive_guid, (const void *)pentryB, TYPE_GUID_SIZE);
-		} else if (get_partition_attribute(disk, slotB, ATTR_SLOT_ACTIVE) == 1) {
-			// B is the current active slot
-			memcpy((void *)active_guid, (const void *)pentryB, TYPE_GUID_SIZE);
-			memcpy((void *)inactive_guid, (const void *)pentryA, TYPE_GUID_SIZE);
-		} else {
-			fprintf(stderr, "Both A & B are inactive..Aborting");
-			return -1;
-		}
-		int a_state = slot == 0 ? SLOT_ACTIVE : SLOT_INACTIVE;
-		int b_state = slot == 1 ? SLOT_ACTIVE : SLOT_INACTIVE;
-
-		// This check *Really* shouldn't be here... But I don't know this codebase
-		// well enough to remove it.
-		if (slot > 1) {
-			fprintf(stderr, "%s: Unknown slot %d!\n", __func__, slot);
-			return -1;
-		}
-
-		// Mark A as active in primary table
-		UPDATE_SLOT(pentryA, active_guid, a_state);
-		// Mark A as active in backup table
-		UPDATE_SLOT(pentryA_bak, active_guid, a_state);
-		// Mark B as inactive in primary table
-		UPDATE_SLOT(pentryB, inactive_guid, b_state);
-		// Mark B as inactive in backup table
-		UPDATE_SLOT(pentryB_bak, inactive_guid, b_state);
-	}
-
-	// write updated content to disk
-	if (gpt_disk_commit(disk)) {
-		fprintf(stderr, "Failed to commit disk entry");
-		return -1;
-	}
-
-	return 0;
-}
-
 int set_active_boot_slot(unsigned slot, bool ignore_missing_bsg)
 {
-	enum boot_chain chain = (enum boot_chain)slot;
-	struct gpt_disk disk = { 0 };
-	int rc;
-	bool ismmc;
+	struct bootloader_control ctrl;
 
+	(void)ignore_missing_bsg;
 	if (boot_control_check_slot_sanity(slot)) {
 		fprintf(stderr, "%s: Bad arguments\n", __func__);
 		return -1;
 	}
 
-	ismmc = gpt_utils_is_partition_backed_by_emmc(PTN_XBL AB_SLOT_A_SUFFIX);
-
-	// Do this *before* updating all the slot attributes
-	// to make sure we can
-	if (!ismmc && !ignore_missing_bsg && ufs_bsg_dev_open() < 0) {
+	if (load_misc_bootloader_control(&ctrl))
 		return -1;
+
+	if (slot >= ctrl.nb_slot)
+		return -1;
+
+	for (unsigned int i = 0; i < ctrl.nb_slot; i++) {
+		if (i != slot && ctrl.slot_info[i].priority >= ACTIVE_BOOT_PRIORITY)
+			ctrl.slot_info[i].priority = ACTIVE_BOOT_PRIORITY - 1;
 	}
 
-	rc = boot_ctl_set_active_slot_for_partitions(&disk, slot);
+	ctrl.slot_info[slot].priority = ACTIVE_BOOT_PRIORITY;
+	ctrl.slot_info[slot].tries_remaining = ACTIVE_BOOT_TRIES;
 
-	if (rc) {
-		fprintf(stderr, "%s: Failed to set active slot for partitions \n", __func__);
-		goto out;
-	}
-
-	// EMMC doesn't need attributes to be set.
-	if (ismmc)
-		goto out;
-
-	if (chain > BACKUP_BOOT) {
-		fprintf(stderr, "%s: Unknown slot %d!\n", __func__, slot);
-		rc = -1;
-		goto out;
-	}
-
-	rc = gpt_utils_set_xbl_boot_partition(chain);
-	if (rc) {
-		if (ignore_missing_bsg && rc == -ENODEV)
-			rc = 0;
-		else
-			fprintf(stderr, "%s: Failed to switch xbl boot partition\n", __func__);
-	}
-
-out:
-	gpt_disk_free(&disk);
-	return rc;
+	return write_misc_bootloader_control(&ctrl);
 }
 
 int set_slot_as_unbootable(unsigned slot)
 {
-	struct gpt_disk disk = { 0 };
-	int ret;
+	struct bootloader_control ctrl;
 
 	if (boot_control_check_slot_sanity(slot) != 0)
 		return -1;
 
-	ret = update_slot_attribute(&disk, slot, ATTR_UNBOOTABLE);
+	if (load_misc_bootloader_control(&ctrl))
+		return -1;
 
-	gpt_disk_free(&disk);
-	return ret;
+	if (slot >= ctrl.nb_slot)
+		return -1;
+
+	ctrl.slot_info[slot].successful_boot = 0;
+	ctrl.slot_info[slot].tries_remaining = 0;
+	return write_misc_bootloader_control(&ctrl);
 }
 
 int is_slot_marked_successful(unsigned slot)
 {
-	int ret;
-	struct gpt_disk disk = { 0 };
+	struct bootloader_control ctrl;
 
 	if (boot_control_check_slot_sanity(slot) != 0)
 		return -1;
 
-	ret = get_boot_attr(&disk, slot, ATTR_BOOT_SUCCESSFUL);
-	gpt_disk_free(&disk);
-	return ret;
+	if (load_misc_bootloader_control(&ctrl))
+		return -1;
+
+	if (slot >= ctrl.nb_slot)
+		return -1;
+
+	return ctrl.slot_info[slot].successful_boot && ctrl.slot_info[slot].tries_remaining;
 }
 
 const struct boot_control_module bootctl = {

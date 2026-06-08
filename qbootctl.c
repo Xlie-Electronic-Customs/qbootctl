@@ -88,7 +88,6 @@ int usage()
 	fprintf(stderr, "    -s SLOT          set to active slot to SLOT\n");
 	fprintf(stderr, "    -m [SLOT]        mark a boot as successful (default: current)\n");
 	fprintf(stderr, "    -u [SLOT]        mark SLOT as unbootable (default: current)\n");
-	fprintf(stderr, "    -i               still write the GPT headers even if the UFS bLun can't be changed (default: false)\n");
 	// clang-format on
 
 	return 1;
@@ -136,7 +135,6 @@ int main(int argc, char **argv)
 	int optflag;
 	int slot = -1, current_slot;
 	int rc;
-	bool ignore_missing_bsg = false;
 
 	if(geteuid() != 0) {
 		fprintf(stderr, "This program must be run as root!\n");
@@ -188,7 +186,7 @@ int main(int argc, char **argv)
 		printf("%s\n", impl->getSuffix(slot));
 		return 0;
 	case 's':
-		rc = impl->setActiveBootSlot(slot, ignore_missing_bsg);
+		rc = impl->setActiveBootSlot(slot, false);
 		if (rc < 0) {
 			fprintf(stderr, "SLOT %s: Failed to set active\n",
 				impl->getSuffix(slot));
@@ -213,9 +211,6 @@ int main(int argc, char **argv)
 		}
 		printf("SLOT %s: Set as unbootable\n", impl->getSuffix(slot));
 		return 0;
-	case 'i':
-		ignore_missing_bsg = true;
-		break;
 	case 'h':
 	default:
 		usage();

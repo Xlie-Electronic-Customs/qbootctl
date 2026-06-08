@@ -213,9 +213,6 @@ static uint8_t *gpt_pentry_seek(const char *ptn_name, const uint8_t *pentries_st
 	return NULL;
 }
 
-// Defined in ufs-bsg.cpp
-int32_t set_boot_lun(uint8_t lun_id);
-
 // Switch between using either the primary or the backup
 // boot LUN for boot. This is required since UFS boot partitions
 // cannot have a backup GPT which is what we use for failsafe
@@ -235,55 +232,8 @@ int32_t set_boot_lun(uint8_t lun_id);
 // the boot lun to either LUNA or LUNB
 int gpt_utils_set_xbl_boot_partition(enum boot_chain chain)
 {
-	struct stat st;
-	uint8_t boot_lun_id = 0;
-	const char *boot_dev = NULL;
-	int ret = -1;
-
-	(void)st;
-	(void)boot_dev;
-
-	if (chain == BACKUP_BOOT) {
-		boot_lun_id = BOOT_LUN_B_ID;
-		if (!stat(XBL_BACKUP, &st))
-			boot_dev = XBL_BACKUP;
-		else if (!stat(XBL_AB_SECONDARY, &st))
-			boot_dev = XBL_AB_SECONDARY;
-		else {
-			fprintf(stderr, "%s: Failed to locate secondary xbl\n", __func__);
-			goto error;
-		}
-	} else if (chain == NORMAL_BOOT) {
-		boot_lun_id = BOOT_LUN_A_ID;
-		if (!stat(XBL_PRIMARY, &st))
-			boot_dev = XBL_PRIMARY;
-		else if (!stat(XBL_AB_PRIMARY, &st))
-			boot_dev = XBL_AB_PRIMARY;
-		else {
-			fprintf(stderr, "%s: Failed to locate primary xbl\n", __func__);
-			goto error;
-		}
-	} else {
-		fprintf(stderr, "%s: Invalid boot chain id\n", __func__);
-		goto error;
-	}
-	// We need either both xbl and xblbak or both xbl_a and xbl_b to exist at
-	// the same time. If not the current configuration is invalid.
-	if ((stat(XBL_PRIMARY, &st) || stat(XBL_BACKUP, &st)) &&
-	    (stat(XBL_AB_PRIMARY, &st) || stat(XBL_AB_SECONDARY, &st))) {
-		fprintf(stderr, "%s:primary/secondary XBL prt not found(%s)\n", __func__,
-			strerror(errno));
-		goto error;
-	}
-	LOGD("%s: setting %s lun as boot lun\n", __func__, boot_dev);
-
-	if (set_boot_lun(boot_lun_id)) {
-		ret = -ENODEV;
-		goto error;
-	}
-	return 0;
-error:
-	return ret;
+	(void)chain;
+	return -ENOTSUP;
 }
 
 // Given a parttion name(eg: rpm) get the path to the block device that
